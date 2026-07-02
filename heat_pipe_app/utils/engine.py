@@ -86,7 +86,8 @@ class HeatPipeRecommendationEngine:
         heat_flux = heat_load / heat_source_area
         cooling_method = cooling_method.strip().title()
         orientation = orientation.strip().title()
-        
+        print("Available columns:", self.design_catalog.columns)
+        # Keep the existing line 92 below this print
         # 1. Filter structural space constraints
         candidates = self.design_catalog[
             (self.design_catalog['Heat Pipe Length'] <= max_length) & 
