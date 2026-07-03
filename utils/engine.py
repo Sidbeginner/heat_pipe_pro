@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class HeatPipeRecommendationEngine:
-    def __init__(self, data_path='clean_heat_pipe_dataset.csv'):
+    def __init__(self, data_path='data/clean_heat_pipe_dataset.csv'):
         self.data_path = data_path
         self.df = None
         self.model_resistance = None
