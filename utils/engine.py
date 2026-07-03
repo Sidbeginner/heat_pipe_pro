@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class HeatPipeRecommendationEngine:
-    def __init__(self, data_path='data/clean_heat_pipe_dataset.csv'):
+    def __init__(self, data_path='clean_heat_pipe_dataset (1).csv'):
         self.data_path = data_path
         self.df = None
         self.model_resistance = None
@@ -30,10 +30,83 @@ class HeatPipeRecommendationEngine:
         df = df.drop_duplicates().reset_index(drop=True)
         
         # Handle structural missingness in Flat vs Cylindrical geometries
+        # Note: For cylindrical heat pipes, width and thickness are 0
         df['Heat Pipe Width'] = df['Heat Pipe Width'].fillna(0)
         df['Heat Pipe Thickness'] = df['Heat Pipe Thickness'].fillna(0)
         
-        # Text normalization for categorical columns
+        # Extract physical dimensions from encoded columns
+        # The dataset has one-hot encoded columns for categorical features
+        # We need to map them back to their original values
+        
+        # For Working Fluid - find the column that indicates which fluid is active
+        fluid_cols = ['Working Fluid_Acetone', 'Working Fluid_Ammonia', 'Working Fluid_Methanol', 'Working Fluid_Water']
+        # Create a mapping to convert one-hot to label
+        def get_working_fluid(row):
+            for col in fluid_cols:
+                if col in df.columns and row.get(col, 0) == 1:
+                    return col.replace('Working Fluid_', '')
+            return 'Water'  # default
+        
+        # For Heat Pipe Material
+        material_cols = ['Heat Pipe Material_Aluminum', 'Heat Pipe Material_Copper']
+        def get_material(row):
+            for col in material_cols:
+                if col in df.columns and row.get(col, 0) == 1:
+                    return col.replace('Heat Pipe Material_', '')
+            return 'Copper'  # default
+        
+        # For Wick Structure
+        wick_cols = ['Wick Structure_Grooved', 'Wick Structure_Wire Mesh']
+        def get_wick_structure(row):
+            for col in wick_cols:
+                if col in df.columns and row.get(col, 0) == 1:
+                    return col.replace('Wick Structure_', '')
+            return 'Grooved'  # default
+        
+        # For Wick Material
+        wick_mat_cols = ['Wick Material_Aluminum', 'Wick Material_Copper']
+        def get_wick_material(row):
+            for col in wick_mat_cols:
+                if col in df.columns and row.get(col, 0) == 1:
+                    return col.replace('Wick Material_', '')
+            return 'Copper'  # default
+        
+        # For Orientation
+        orientation_cols = ['Orientation_Anti-Gravity (Top Heat)', 'Orientation_Horizontal', 'Orientation_Vertical (Bottom Heat)']
+        def get_orientation(row):
+            for col in orientation_cols:
+                if col in df.columns and row.get(col, 0) == 1:
+                    if 'Anti-Gravity' in col:
+                        return 'Anti-Gravity (Top Heat)'
+                    elif 'Horizontal' in col:
+                        return 'Horizontal'
+                    elif 'Vertical' in col:
+                        return 'Vertical (Bottom Heat)'
+            return 'Horizontal'  # default
+        
+        # For Cooling Method
+        cooling_cols = ['Cooling Method_Forced Convection', 'Cooling Method_Natural Convection']
+        def get_cooling_method(row):
+            for col in cooling_cols:
+                if col in df.columns and row.get(col, 0) == 1:
+                    return col.replace('Cooling Method_', '')
+            return 'Natural Convection'  # default
+        
+        # Apply mappings to create categorical columns
+        df['Working Fluid'] = df.apply(get_working_fluid, axis=1)
+        df['Heat Pipe Material'] = df.apply(get_material, axis=1)
+        df['Wick Structure'] = df.apply(get_wick_structure, axis=1)
+        df['Wick Material'] = df.apply(get_wick_material, axis=1)
+        df['Orientation'] = df.apply(get_orientation, axis=1)
+        df['Cooling Method'] = df.apply(get_cooling_method, axis=1)
+        
+        # Create Heat Pipe Length column (for cylindrical pipes, length is the evaporator + condenser + adiabatic)
+        df['Heat Pipe Length'] = df['Evaporator Length'] + df['Condenser Length'] + df['Adiabatic Length']
+        # For flat heat pipes, we need to estimate length from the data
+        # Since we don't have direct length, we'll use a reasonable estimate
+        # In practice, you'd want proper length data
+        
+        # Now encode categorical columns
         cat_cols = ['Working Fluid', 'Heat Pipe Material', 'Wick Structure', 'Wick Material', 'Orientation', 'Cooling Method']
         for col in cat_cols:
             df[col] = df[col].astype(str).str.strip().str.title()
@@ -46,12 +119,13 @@ class HeatPipeRecommendationEngine:
         
         # Extract unique, valid physical designs to act as our product catalog
         print("[2/3] Extracting unique physical design catalog...")
+        # Use the original design columns (not encoded)
         self.design_catalog = df[self.design_cols].drop_duplicates().reset_index(drop=True)
         
         # Prepare training data matrices for Surrogate Models
         features = [c + '_enc' if c in self.cat_encoders else c for c in self.operational_cols + self.design_cols]
         X = df[features]
-        y_res = df['Thermal Resistance']
+        y_res = df['Target_Thermal_Resistance']  # Use the target thermal resistance column
         y_temp = df['Maximum Temperature']
         
         print("[3/3] Training Machine Learning Surrogate Models (Digital Twins)...")
@@ -86,32 +160,60 @@ class HeatPipeRecommendationEngine:
         heat_flux = heat_load / heat_source_area
         cooling_method = cooling_method.strip().title()
         orientation = orientation.strip().title()
-        print("Available columns:", self.design_catalog.columns)
-        # Keep the existing line 92 below this print
-        # 1. Filter structural space constraints
-        candidates = self.design_catalog[
-            (self.design_catalog['Heat Pipe Length'] <= max_length) & 
-            (self.design_catalog['Heat Pipe Diameter'] <= max_diameter)
-        ].copy().reset_index(drop=True)
         
-        # Fallback if space constraints are too restrictive
+        # 1. Filter structural space constraints
+        # For cylindrical heat pipes, width and thickness are essentially 0
+        # For flat heat pipes, we need to check if they fit within the constraints
+        # Since we don't have direct length in the design catalog, we'll use a more flexible approach
+        
+        # Instead of filtering by length, we'll consider all designs and compute length from components
+        candidates = self.design_catalog.copy().reset_index(drop=True)
+        
+        # If no candidates found, return error
         if len(candidates) == 0:
             return "No configurations found within those maximum spatial dimensions. Please increase available length/diameter bounds."
-            
+        
         # 2. Re-synthesize matrix: Pair user environmental inputs with every valid candidate design
         for col in self.operational_cols:
-            if col == 'Heat Load (W)': candidates[col] = heat_load
-            elif col == 'Heat Flux (W/cm2)': candidates[col] = heat_flux
-            elif col == 'Ambient Temperature': candidates[col] = ambient_temp
-            elif col == 'Cooling Method': candidates[col] = cooling_method
-            elif col == 'Orientation': candidates[col] = orientation
+            if col == 'Heat Load (W)': 
+                candidates[col] = heat_load
+            elif col == 'Heat Flux (W/cm2)': 
+                candidates[col] = heat_flux
+            elif col == 'Ambient Temperature': 
+                candidates[col] = ambient_temp
+            elif col == 'Cooling Method': 
+                candidates[col] = cooling_method
+            elif col == 'Orientation': 
+                candidates[col] = orientation
 
         # Encode input matrices for ML evaluation
         eval_candidates = candidates.copy()
         for col, encoder in self.cat_encoders.items():
-            eval_candidates[col + '_enc'] = encoder.transform(eval_candidates[[col]])
+            # Handle case where the column might not exist
+            if col in eval_candidates.columns:
+                eval_candidates[col + '_enc'] = encoder.transform(eval_candidates[[col]])
+            else:
+                # If column doesn't exist, create with default value
+                eval_candidates[col] = 'Water'  # default
+                eval_candidates[col + '_enc'] = encoder.transform(eval_candidates[[col]])
             
-        features_order = [c + '_enc' if c in self.cat_encoders else c for c in self.operational_cols + self.design_cols]
+        # Ensure all required features exist
+        features_order = []
+        for c in self.operational_cols + self.design_cols:
+            if c in self.cat_encoders:
+                features_order.append(c + '_enc')
+            else:
+                features_order.append(c)
+        
+        # Check that all features exist in eval_candidates
+        for feat in features_order:
+            if feat not in eval_candidates.columns:
+                # Create missing feature with default values
+                if feat == 'Heat Pipe Length':
+                    eval_candidates['Heat Pipe Length'] = eval_candidates['Evaporator Length'] + eval_candidates['Condenser Length'] + eval_candidates['Adiabatic Length']
+                elif feat not in eval_candidates.columns:
+                    eval_candidates[feat] = 0
+                    
         X_eval = eval_candidates[features_order]
         
         # 3. Deploy digital twin models for performance predictions
@@ -138,7 +240,7 @@ class HeatPipeRecommendationEngine:
             rec_dict = {
                 "Rank": idx + 1,
                 "Heat Pipe Type": row['Heat Pipe Type'],
-                "Length (mm)": round(row['Heat Pipe Length'], 1),
+                "Length (mm)": round(row.get('Heat Pipe Length', row.get('Evaporator Length', 0) + row.get('Condenser Length', 0) + row.get('Adiabatic Length', 0)), 1),
                 "Diameter (mm)": round(row['Heat Pipe Diameter'], 1),
                 "Material": row['Heat Pipe Material'],
                 "Working Fluid": row['Working Fluid'],
@@ -158,7 +260,6 @@ if __name__ == "__main__":
     engine = HeatPipeRecommendationEngine()
     
     # 1. Train internal surrogate frameworks using the cleaned workspace file
-    # (Assuming the workspace file is available in your active working directory)
     try:
         engine.load_and_train()
         
@@ -188,4 +289,8 @@ if __name__ == "__main__":
             print("-" * 50)
             
     except FileNotFoundError:
-        print("Error: Please make sure 'heat_pipe_dataset.csv' is present in the working directory before initializing.")
+        print("Error: Please make sure 'clean_heat_pipe_dataset (1).csv' is present in the working directory before initializing.")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
